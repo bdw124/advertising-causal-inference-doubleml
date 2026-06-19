@@ -1,0 +1,9 @@
+venv/
+.env
+__pycache__/
+.ipynb_checkpoints/
+data/
+*.csv
+*.parquet
+*.pkl
+.DS_Store
