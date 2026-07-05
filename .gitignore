@@ -1,9 +1,27 @@
-venv/
-.env
+# Python cache files
 __pycache__/
-.ipynb_checkpoints/
-data/
-*.csv
-*.parquet
-*.pkl
+*.py[cod]
+*.pyo
+
+# Build / packaging outputs
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
 .DS_Store
+Thumbs.db
