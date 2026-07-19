@@ -62,19 +62,20 @@ DTYPES = {
     "usertag": "string",
 }
 
-COLUMNS_TO_DROP = ["bidid", "logtype", "ipinyouid", "IP", "url", "urlid", "payprice"]
+COLUMNS_TO_DROP = ["bidid", "logtype", "ipinyouid", "IP", "url", "urlid", "payprice","timestamp"]
 
+# advertiser not included here as constant when only looking at 1458
 VARIABLES_ONE_HOT = [
     "adexchange", "useragent", "weekday", "region", "slotwidth",
     "slotheight", "slotvisibility", "slotformat", "bidprice",
-    "advertiser", "keypage",
+    "keypage",
 ]
 
 MULTI_LABEL_COLUMN = "usertag"
 
 # Left un-encoded on purpose - to be target-encoded during DoubleML
 # cross-fitting, not here.
-TARGET_CATEGORICAL_FEATURES = ["city", "domain", "slotid", "slotprice", "creative"]
+TARGET_CATEGORICAL_FEATURES = ["city", "domain", "slotid", "slotprice"] # no creative here as D = creative
 
 
 # --------------------------------------------------------------------------- #
@@ -165,3 +166,5 @@ if __name__ == "__main__":
     df = build_feature_matrix()
     print(df.shape)
     print(df.head())
+    print(df['advertiser'])
+    print('Feature engineering script finished.')
