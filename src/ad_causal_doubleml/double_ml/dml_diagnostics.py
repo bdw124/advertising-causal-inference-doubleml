@@ -32,18 +32,23 @@ pipeline itself.
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.metrics import log_loss, roc_auc_score, average_precision_score
 from sklearn.model_selection import train_test_split
 
+print("Starting imports in dml_diagnostics...")
 from dml_creative import (
     HIGH_CARD_COLS,
     OUTCOME_COL,
     RANDOM_STATE,
     TREATMENT_COL,
     build_design_matrix,
+    build_model_t_estimator,
+    build_model_y_estimator,
     load_features,
     make_nuisance_pipeline,
+    compute_overlap_trim_mask,
 )
+print("Finished imports in dml_diagnostics")
 
 TEST_SIZE = 0.3
 
@@ -60,9 +65,9 @@ def check_outcome_model(W, Y):
     low_card_idx = list(range(len(HIGH_CARD_COLS), W.shape[1]))
 
     pipeline = make_nuisance_pipeline(
-        HistGradientBoostingClassifier(random_state=RANDOM_STATE),
-        high_card_idx, low_card_idx,
+        build_model_y_estimator(), high_card_idx, low_card_idx,
     )
+
     pipeline.fit(W_train, Y_train)
     p_hat = pipeline.predict_proba(W_test)[:, 1]
 
@@ -76,6 +81,8 @@ def check_outcome_model(W, Y):
           "  <- predicting the marginal rate for every row, no covariates at all")
     print(f"Model AUC:                   {roc_auc_score(Y_test, p_hat):.4f}"
           "  <- 0.5 = no better than random ranking")
+    print(f"Model Average Preciosion Score (way of summarizing a PR-AUC):                   {average_precision_score(Y_test, p_hat):.4f}"
+        "  <- 0.5 = no better than random ranking")
     print(f"Predicted probability range: [{p_hat.min():.6f}, {p_hat.max():.6f}]")
     print(
         "\nInterpretation: if model log-loss is barely better than baseline "
@@ -97,9 +104,9 @@ def check_treatment_model(W, T):
     low_card_idx = list(range(len(HIGH_CARD_COLS), W.shape[1]))
 
     pipeline = make_nuisance_pipeline(
-        HistGradientBoostingClassifier(random_state=RANDOM_STATE),
-        high_card_idx, low_card_idx,
+        build_model_t_estimator(), high_card_idx, low_card_idx,
     )
+
     pipeline.fit(W_train, T_train)
     proba = pipeline.predict_proba(W_test)
     classes = pipeline.classes_
@@ -165,6 +172,14 @@ if __name__ == "__main__":
         c for c in df.columns
         if c not in HIGH_CARD_COLS + [OUTCOME_COL, TREATMENT_COL]
     ]
+    # compute overlap mask 
+    mask = compute_overlap_trim_mask(df,
+                                     engineered_low_card_cols,
+                                     threshold = 0.001)
+    # apply trimming
+    df = df.loc[mask].reset_index(drop=True)
+
+    # build design matrix on trimmed data
     W, _, _ = build_design_matrix(df, engineered_low_card_cols)
     Y = df[OUTCOME_COL].to_numpy()
     T = df[TREATMENT_COL].to_numpy()

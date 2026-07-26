@@ -6,8 +6,21 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import TargetEncoder
+from sklearn.model_selection import cross_val_predict
  
 from econml.dml import LinearDML
+
+from datetime import datetime
+
+start_time = datetime.now()
+
+print(f"Script started: {start_time:%Y-%m-%d %H:%M:%S}")
+
+# setting options to be able to see the entire table output 
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)          # Automatically detect terminal width
+pd.set_option('display.max_colwidth', None)   # Don't truncate long cell contents
 
 #from feature_engineering import build_feature_matrix, TARGET_CATEGORICAL_FEATURES
 sklearn.set_config(transform_output="default")
@@ -30,6 +43,29 @@ HIGH_CARD_COLS = TARGET_CATEGORICAL_FEATURES  # ["city", "domain", "slotid", "sl
 # creative column has the cardinality expected.
 EXPECTED_N_TREATMENT_LEVELS = 8
 
+
+
+def build_model_y_estimator() -> HistGradientBoostingClassifier:
+    """
+    Outcome (click) classifier. class_weight="balanced" addresses the
+    extreme rarity of click (0.08%)
+    """
+    return HistGradientBoostingClassifier(
+        random_state=RANDOM_STATE,
+        max_iter=60
+    )
+
+def build_model_t_estimator() -> HistGradientBoostingClassifier:
+    """
+    Treatment (creative) classifier. No class weight as creative
+    does not suffer same sparsity issue.
+    """
+    return HistGradientBoostingClassifier(
+        random_state=RANDOM_STATE,
+        max_iter=60,
+    )
+
+
 # --------------------------------------------------------------------------
 # 1. Load features
 # --------------------------------------------------------------------------
@@ -46,8 +82,8 @@ def load_features() -> pd.DataFrame:
     df = build_feature_matrix() # uses the func from feature_engineering
     print('Finished loading feature matrix.')
     print(df.columns)
-    for col in ["domain", "slotid"]:
-        df[col] = df[col].astype(str)
+    #for col in ["domain"]:
+    #    df[col] = df[col].astype(str)
 
     n_levels = df[TREATMENT_COL].nunique()
     if n_levels != EXPECTED_N_TREATMENT_LEVELS:
@@ -127,6 +163,7 @@ def build_design_matrix(df: pd.DataFrame, low_card_cols: list[str]):
     the nuisance pipelines rely on): high-cardinality columns first, then
     the already-engineered low-cardinality block.
     """
+
     print('Starting build_design_matrix.')
     ordered_cols = HIGH_CARD_COLS + low_card_cols
     W = df[ordered_cols]
@@ -134,6 +171,65 @@ def build_design_matrix(df: pd.DataFrame, low_card_cols: list[str]):
     low_card_idx = list(range(len(HIGH_CARD_COLS), len(ordered_cols)))
     print('Finished build_design_matrix.')
     return W, high_card_idx, low_card_idx
+
+def compute_overlap_trim_mask(df: pd.DataFrame, low_card_cols: list[str], threshold: float = 0.1):
+    """
+    Fits model_t via honest out-of-fold cross-validation across the WHOLE
+    dataset (same fold discipline EconML uses internally -- a row's
+    propensity is never predicted by a model that was trained on that
+    row), then returns a boolean mask for rows with
+    P(observed creative | X) >= threshold (Crump et al. 2009's standard
+    rule of thumb), plus a before/after diagnostic table printed to screen.
+
+    NOTE: this refits model_t via cross-validation independently of the
+    real DML fit -- it's necessarily a second, separate cost on top of
+    what EconML does internally, since trimming has to happen BEFORE the
+    real fit can run on the trimmed sample.
+    """
+    W, high_card_idx, low_card_idx = build_design_matrix(df, low_card_cols)
+    T = df[TREATMENT_COL].to_numpy()
+
+    pipeline = make_nuisance_pipeline(build_model_t_estimator(), high_card_idx, low_card_idx)
+    cv = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+
+    print("Fitting model_t out-of-fold across the full dataset for trimming (this refits model_t; expect similar runtime to one nuisance-model pass)...")
+    proba = cross_val_predict(pipeline, W, T, cv=cv, method="predict_proba")
+
+
+    # Overlap requires EVERY treatment category to have a real chance for
+    # each row's covariates -- not just that the observed category was
+    # plausible. Use the minimum probability across all 8 categories, per
+    # row, as the overlap statistic. (Previously this used P(observed
+    # creative|X) instead, which flags the wrong thing -- a HIGH value
+    # there means the row's covariates near-uniquely determine the
+    # creative it got, which is the deterministic case, not the safe one.)
+    min_propensity = proba.min(axis=1)
+
+    n_categories = len(np.unique(T))
+    ceiling = 1 / n_categories
+    print(f"(Theoretical ceiling for {n_categories} categories: 1/{n_categories} = {ceiling:.4f} -- "
+        f"the minimum can never exceed this even under perfectly even assignment, "
+        f"so pick threshold relative to that, not a flat number.)")
+    print(pd.Series(min_propensity).describe())
+
+    mask = min_propensity >= threshold
+
+    # --- before/after diagnostics, per creative ---
+    diag = pd.DataFrame({TREATMENT_COL: T, OUTCOME_COL: df[OUTCOME_COL].to_numpy(), "kept": mask})
+    before = diag.groupby(TREATMENT_COL).agg(n_rows_before=(OUTCOME_COL, "size"), n_clicks_before=(OUTCOME_COL, "sum"))
+    after = diag[diag["kept"]].groupby(TREATMENT_COL).agg(n_rows_after=(OUTCOME_COL, "size"), n_clicks_after=(OUTCOME_COL, "sum"))
+    summary = before.join(after).fillna(0)
+    summary["rows_trimmed"] = summary["n_rows_before"] - summary["n_rows_after"]
+    summary["clicks_trimmed"] = summary["n_clicks_before"] - summary["n_clicks_after"]
+    summary["pct_rows_trimmed"] = (summary["rows_trimmed"] / summary["n_rows_before"] * 100).round(2)
+
+    print(f"\n=== Overlap trim (threshold={threshold}) ===")
+    print(summary.to_string()) # as an attempt to view the entire table
+    summary.to_csv("overlap_summary_table.csv")
+    print(f"\nTotal rows: {len(df):,} -> {mask.sum():,} ({mask.mean():.1%} kept)")
+    print(f"Total clicks: {diag[OUTCOME_COL].sum():,} -> {diag.loc[mask, OUTCOME_COL].sum():,}")
+
+    return mask
 
 # --------------------------------------------------------------------------
 # 3. Fit DML
@@ -144,23 +240,21 @@ def fit_dml(df: pd.DataFrame, low_card_cols: list[str]) -> LinearDML:
     W, high_card_idx, low_card_idx = build_design_matrix(df, low_card_cols)
  
     model_y_pipeline = make_nuisance_pipeline(
-        HistGradientBoostingClassifier(random_state=RANDOM_STATE,
-                                       max_iter=30,
-                                       verbose=1),
-        high_card_idx,
-        low_card_idx,
+        build_model_y_estimator(), high_card_idx,  low_card_idx,
     )
+
     model_t_pipeline = make_nuisance_pipeline(
-        HistGradientBoostingClassifier(random_state=RANDOM_STATE,
-                                       max_iter=30,
-                                       verbose=1),
-        high_card_idx,
-        low_card_idx,
+        build_model_t_estimator(), high_card_idx, low_card_idx,
     )
+
  
     Y = df[OUTCOME_COL].to_numpy()
     T = df[TREATMENT_COL].to_numpy()
-    categories = sorted(pd.unique(T).tolist())
+    categories = ["48f2e9ba15708c0146bda5e1dd653caa"] + [
+    c for c in sorted(pd.unique(T).tolist()) if c != "48f2e9ba15708c0146bda5e1dd653caa"
+    ]
+    # sorting alphabetically resulted in the group with the lowest clicks being the comparison 
+    #categories = sorted(pd.unique(T).tolist())
  
     # LinearDML gives an average treatment effect per creative category
     # (vs. a baseline category) with a linear final stage 
@@ -187,6 +281,8 @@ def fit_dml(df: pd.DataFrame, low_card_cols: list[str]) -> LinearDML:
     # X=None: all covariates enter as controls (W) only, giving one ATE per
     # treatment category rather than a CATE surface. See note above if you
     # want heterogeneity.
+
+
     est.fit(Y, T, X=None, W=W)
     return est
  
@@ -202,14 +298,25 @@ def report(est: LinearDML) -> None:
  
 if __name__ == "__main__":
     df = load_features()
- 
-    # ASSUMPTION: adjust this to the actual list of already-engineered
-    # low-cardinality column names your feature_engineering.py produces
-    # (one-hot dummies, hour_sin/hour_cos, usertag_* MLB columns, etc.)
+    print(f"df shape: {df.shape}")
+    # Testing
+    #df = df.sample(frac=0.1)
+    #print(f"df shape: {df.shape}")
     engineered_low_card_cols = [
         c for c in df.columns
         if c not in HIGH_CARD_COLS + [OUTCOME_COL, TREATMENT_COL]
     ]
- 
+
+    mask = compute_overlap_trim_mask(df, engineered_low_card_cols, threshold=0.001)
+    df = df.loc[mask].reset_index(drop=True)  # reset_index matters -- same reason build_design_matrix needs clean positional indices
+
     est = fit_dml(df, engineered_low_card_cols)
     report(est)
+
+end_time = datetime.now()
+elapsed = end_time - start_time
+
+print("\n" + "=" * 80)
+print(f"Script finished: {end_time:%Y-%m-%d %H:%M:%S}")
+print(f"Total runtime:   {elapsed}")
+print("=" * 80)

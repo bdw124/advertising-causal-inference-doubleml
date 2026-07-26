@@ -16,6 +16,9 @@ into the covariates.
 import numpy as np
 import pandas as pd
 
+print(pd.options.mode.string_storage)
+import pyarrow
+
 from ad_causal_doubleml.config.paths import DATA_DIR
 
 from sklearn import set_config
@@ -61,21 +64,25 @@ DTYPES = {
     "keypage": "string",
     "usertag": "string",
 }
+# dropping slot width and slot height as there is no variation with respect to creative
 
-COLUMNS_TO_DROP = ["bidid", "logtype", "ipinyouid", "IP", "url", "urlid", "payprice","timestamp"]
+COLUMNS_TO_DROP = ["bidid", "logtype", "ipinyouid", "IP", "url", "urlid", "payprice","timestamp","slotheight","slotwidth","slotid","domain"]
+
 
 # advertiser not included here as constant when only looking at 1458
 VARIABLES_ONE_HOT = [
-    "adexchange", "useragent", "weekday", "region", "slotwidth",
-    "slotheight", "slotvisibility", "slotformat", "bidprice",
-    "keypage",
+    "adexchange", "useragent", "weekday", "region", "slotvisibility", "bidprice","keypage","slotformat"
 ]
 
 MULTI_LABEL_COLUMN = "usertag"
 
 # Left un-encoded on purpose - to be target-encoded during DoubleML
 # cross-fitting, not here.
-TARGET_CATEGORICAL_FEATURES = ["city", "domain", "slotid", "slotprice"] # no creative here as D = creative
+TARGET_CATEGORICAL_FEATURES = ["city", "slotprice"] # no creative here as D = creative
+
+
+CREATIVES_TO_DROP = ["fb5afa9dba1274beaf3dad86baf97e89", "832b91d59d0cb5731431653204a76c0e","a499988a822facd86dd0e8e4ffef8532"]
+
 
 
 # --------------------------------------------------------------------------- #
@@ -84,18 +91,25 @@ TARGET_CATEGORICAL_FEATURES = ["city", "domain", "slotid", "slotprice"] # no cre
 
 def load_data(file_path: str = FILE_PATH, dtypes: dict = DTYPES) -> pd.DataFrame:
     """Load the raw iPinYou log file with explicit dtypes to keep memory down."""
+    print("Reading in csv...")
     df = pd.read_csv(
         file_path,
         sep="\t",
         dtype=dtypes,
         na_values=["null"],
     )
+    print("Finished loading df.")
     return df
 
 
 def drop_unused_columns(df: pd.DataFrame, columns: list = COLUMNS_TO_DROP) -> pd.DataFrame:
     """Drop identifier / redundant columns not used in feature engineering."""
     return df.drop(columns=columns)
+
+
+def drop_creatives_with_no_variation_in_slot_visibility(df: pd.DataFrame, rows: list = CREATIVES_TO_DROP) -> pd.DataFrame:
+    """"""
+    return df[~df["creative"].isin(rows)]
 
 
 def add_cyclical_hour_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -156,9 +170,14 @@ def build_feature_matrix(file_path: str = FILE_PATH) -> pd.DataFrame:
     """
     df = load_data(file_path)
     df = drop_unused_columns(df)
+    # commented out whilst testing if trimming does this appropriately
+    df = drop_creatives_with_no_variation_in_slot_visibility(df)
     df = add_cyclical_hour_features(df)
     df = one_hot_encode(df)
     df = multi_label_binarize_usertag(df)
+    print(f"df.shape: {df.shape}.")
+    print(f"df.head: {df.head(5)}")
+
     return df
 
 
