@@ -1,41 +1,22 @@
 """
-After creating dml_creative.py realised that I wasn't testing the model 
-performance before getting results, so this script is a littler of an 
-after thought. 
 
+Diagnostics for the models inside dml_ipinyou.py's LinearDML fit.
 
-Diagnostics for the nuisance models inside dml_ipinyou.py's LinearDML fit.
-
-Run this BEFORE trusting any DML point estimate. It checks two 
-different things:
-
+Checks:
   1. NUISANCE MODEL QUALITY -- does model_y / model_t actually predict
-     well out of sample, or is it overfitting / underfitting? DML's
-     cross-fitting protects you from *bias from reusing the same rows*,
-     but it does nothing to guarantee the nuisance models are any good --
-     a badly-fit model_y or model_t still cross-fits "correctly" and still
-     produces a treatment effect estimate, just an unreliable one.
-
+     well out of sample, or is it overfitting / underfitting? 
   2. OVERLAP / POSITIVITY -- for every treatment category, are there rows
-     where the estimated propensity of receiving the creative they
-     actually got is close to 0? DML's residual-on-residual estimator
-     divides by treatment-residual variance; when propensities are near
-     0 or 1 for some covariate patterns, that variance is tiny and the
-     resulting point estimate can become wildly inflated or even flip
-     sign relative to the raw data -- which is exactly the pattern seen
-     comparing this project's DML output to raw per-creative CTRs.
+     where the estimated propensity of receiving a creative close to 0? 
 
-Neither check feeds back into fit_dml() automatically -- this is a
-standalone, run-it-yourself companion script, not part of the estimation
-pipeline itself.
+
+Neither check feeds back into fit_dml() automatically 
 """
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import log_loss, roc_auc_score, average_precision_score
 from sklearn.model_selection import train_test_split
+from sklearn.calibration import calibration_curve
 
-print("Starting imports in dml_diagnostics...")
 from dml_creative import (
     HIGH_CARD_COLS,
     OUTCOME_COL,
@@ -47,20 +28,23 @@ from dml_creative import (
     load_features,
     make_nuisance_pipeline,
     compute_overlap_trim_mask,
+    UndersampledCalibratedClassifier,
+    N_UNDERSAMPLE_REPEATS
 )
-print("Finished imports in dml_diagnostics")
 
 TEST_SIZE = 0.3
 
-
 # --------------------------------------------------------------------------
-# 1. model_y (click) quality: is it beating the naive "predict the overall
-#    click rate for everyone" baseline, and by how much?
+# model_y (click) quality: is it beating the naive "predict the overall
+# click rate for everyone" baseline, and by how much?
 # --------------------------------------------------------------------------
 def check_outcome_model(W, Y):
     W_train, W_test, Y_train, Y_test = train_test_split(
         W, Y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=Y
     )
+
+    # high_card_idx - which cols of W are high cardinality by position
+    # works because build_design_matrix() always puts HIGH_CARD_COLS first
     high_card_idx = list(range(len(HIGH_CARD_COLS)))
     low_card_idx = list(range(len(HIGH_CARD_COLS), W.shape[1]))
 
@@ -92,9 +76,74 @@ def check_outcome_model(W, Y):
         "just be noisy versions of raw Y.\n"
     )
 
+def check_calibration(Y_test, p_hat, model_name, n_bins=10):
+    """
+    log-loss and AUC are metrics for if model sepeteres clicks 
+    from non-clicks well, but not whether the probability values 
+    themselves are correct. Does not tell you if the model is 
+    well calibrated. 
+
+    If the model is not well calibrated it could be a sign that the 
+    re-calibration step post undersampling is not working well. 
+    """
+
+    # called by compare_outcome_models() below, once per candidate
+    # model, so the two calibration tables that print are directly
+    # comparable - same Y_test, same bins
+    observed_rate, predicted_rate = calibration_curve(
+        Y_test, p_hat, n_bins=n_bins, strategy="quantile"
+    )
+    print(f"=== Calibration curve: {model_name} ===")
+    print(f"{'Predicted (mean)':>20} | {'Observed (actual)':>20}")
+    for pred, obs in zip(predicted_rate, observed_rate):
+        print(f"{pred:>20.6f} | {obs:>20.6f}")
+    print(
+        "\nInterpretation: predicted and observed columns should track "
+        "each other closely. If predicted is systematically much higher "
+        "or lower than observed, probabilities aren't calibrated -- "
+        "residualizing Y against them (Y - mu_hat(X)) will introduce "
+        "bias, not just noise.\n"
+    )
+
+def compare_outcome_models(W, Y):
+    """
+    Runs the plain HistGradientBoostingClassifier and the
+    UndersampledCalibratedClassifier on the SAME held-out split, so their
+    metrics are directly comparable.
+    """
+    W_train, W_test, Y_train, Y_test = train_test_split(
+        W, Y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=Y
+    )
+    high_card_idx = list(range(len(HIGH_CARD_COLS)))
+    low_card_idx = list(range(len(HIGH_CARD_COLS), W.shape[1]))
+
+    # candidates dict pairs a label with an estimator
+    # that has not yet been fitted
+    # only the classifier is different between the two runs
+    candidates = {
+        "plain HGB": build_model_y_estimator(),
+        "undersampled + calibrated": UndersampledCalibratedClassifier(
+            build_model_y_estimator(),
+            n_repeats=N_UNDERSAMPLE_REPEATS,
+            random_state=RANDOM_STATE,
+        ),
+    }
+
+    for name, estimator in candidates.items():
+        pipeline = make_nuisance_pipeline(estimator, high_card_idx, low_card_idx)
+        pipeline.fit(W_train, Y_train)
+        p_hat = pipeline.predict_proba(W_test)[:, 1]
+
+        print(f"\n{'=' * 20} {name} {'=' * 20}")
+        print(f"Log-loss:        {log_loss(Y_test, p_hat):.5f}")
+        print(f"AUC:             {roc_auc_score(Y_test, p_hat):.4f}")
+        print(f"PR-AUC:          {average_precision_score(Y_test, p_hat):.4f}")
+        print(f"Predicted range: [{p_hat.min():.6f}, {p_hat.max():.6f}]")
+        check_calibration(Y_test, p_hat, name) 
+
 
 # --------------------------------------------------------------------------
-# 2. model_t (creative) quality + overlap/positivity
+# model_t (creative) quality + overlap/positivity
 # --------------------------------------------------------------------------
 def check_treatment_model(W, T):
     W_train, W_test, T_train, T_test = train_test_split(
@@ -128,11 +177,8 @@ def check_treatment_model(W, T):
         "creative assignment genuinely does depend on covariates.\n"
     )
 
-    # --- overlap / positivity ---
-    # For each held-out row, the model's estimated probability of the
-    # creative that ACTUALLY was shown. A value near 0 means "this
-    # covariate pattern almost never gets this creative in the data" --
-    # exactly the condition that blows up DML's residual-based estimator.
+    # overlap / positivity
+    # For each held-out row, the model's estimated probability of the creative that was shown. 
     class_to_idx = {c: i for i, c in enumerate(classes)}
     observed_idx = np.array([class_to_idx[t] for t in T_test])
     p_observed = proba[np.arange(len(T_test)), observed_idx]
@@ -152,19 +198,6 @@ def check_treatment_model(W, T):
         .describe()[["mean", "min", "25%", "50%"]]
     )
     print(summary)
-    print(
-        "\nInterpretation: low 'min' / '25%' values for a given creative "
-        "category mean that a meaningful chunk of rows shown that creative "
-        "had a covariate profile the model thinks almost never gets it -- "
-        "i.e. weak overlap for that category. Categories with the smallest "
-        "raw sample sizes (check your earlier value_counts()) are the ones "
-        "most likely to show this. If you see it, consider trimming rows "
-        "with p_observed below a threshold (e.g. Crump et al. 2009's "
-        "common rule of thumb, 0.1) before fitting DML, and reporting the "
-        "trim in your methodology -- this is standard practice, not a "
-        "hack.\n"
-    )
-
 
 if __name__ == "__main__":
     df = load_features()
@@ -185,4 +218,5 @@ if __name__ == "__main__":
     T = df[TREATMENT_COL].to_numpy()
 
     check_outcome_model(W, Y)
+    compare_outcome_models(W, Y)
     check_treatment_model(W, T)
