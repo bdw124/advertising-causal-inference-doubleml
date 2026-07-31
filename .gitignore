@@ -25,3 +25,7 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db.env
+
+# logs 
+src/ad_causal_doubleml/double_ml/logs
+src/ad_causal_doubleml/feature_engineering/logs
