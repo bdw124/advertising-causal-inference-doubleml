@@ -16,7 +16,6 @@ into the covariates.
 import numpy as np
 import pandas as pd
 
-print(pd.options.mode.string_storage)
 import pyarrow
 
 from ad_causal_doubleml.config.paths import DATA_DIR
@@ -175,15 +174,11 @@ def build_feature_matrix(file_path: str = FILE_PATH) -> pd.DataFrame:
     df = add_cyclical_hour_features(df)
     df = one_hot_encode(df)
     df = multi_label_binarize_usertag(df)
-    print(f"df.shape: {df.shape}.")
-    print(f"df.head: {df.head(5)}")
 
     return df
 
 
 if __name__ == "__main__":
     df = build_feature_matrix()
-    print(df.shape)
-    print(df.head())
-    print(df['advertiser'])
+
     print('Feature engineering script finished.')
