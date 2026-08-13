@@ -16,7 +16,7 @@ into the covariates.
 import numpy as np
 import pandas as pd
 
-import pyarrow
+from sklearn.preprocessing import SplineTransformer # hour transformation
 
 from ad_causal_doubleml.config.paths import DATA_DIR
 
@@ -67,7 +67,6 @@ DTYPES = {
 
 COLUMNS_TO_DROP = ["bidid", "logtype", "ipinyouid", "IP", "url", "urlid", "payprice","timestamp","slotheight","slotwidth","slotid","domain"]
 
-
 # advertiser not included here as constant when only looking at 1458
 VARIABLES_ONE_HOT = [
     "adexchange", "useragent", "weekday", "region", "slotvisibility", "bidprice","keypage","slotformat"
@@ -105,6 +104,96 @@ def drop_unused_columns(df: pd.DataFrame, columns: list = COLUMNS_TO_DROP) -> pd
     """Drop identifier / redundant columns not used in feature engineering."""
     return df.drop(columns=columns)
 
+def drop_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+
+    print("Start drop_duplicates function...")
+
+    # identify the duplicate rows
+    df_duplicated = df[df["bidid"].duplicated(keep=False)]
+
+    print(f"df_duplicated before drop: {df_duplicated.shape}")
+    # dropping rows that are identical 
+    df_duplicated = df_duplicated.drop_duplicates()
+    print(f"df_duplicated after drop: {df_duplicated.shape}")
+
+    # dropping rows where usertag is null and we have non-null usertag in other row
+    df_usertag_null = df_duplicated[df_duplicated["usertag"].isna()]
+    df_usertag_not_null = df_duplicated[df_duplicated["usertag"].notna()]
+    # idenitfy rows from df_usertag_null that are in df_usertag_not_null
+    df_usertag_null_in_not_null = df_usertag_null[df_usertag_null['bidid'].isin(df_usertag_not_null['bidid'])]
+
+    result = df_duplicated.merge(df_usertag_null_in_not_null.drop_duplicates(), how='left', indicator=True)
+    df_duplicated = result[result['_merge'] == 'left_only'].drop(columns='_merge')
+
+
+
+    """Retain only latest timestamp"""
+    # Make a copy
+    df_clean = df_duplicated.copy()
+
+    # Convert timestamp to datetime
+    df_clean["timestamp_dt"] = pd.to_datetime(
+        df_clean["timestamp"].astype(str),
+        format="%Y%m%d%H%M%S%f"
+    )
+
+    # Columns that must be identical for two rows to be considered duplicates
+    compare_cols = [
+        col for col in df_clean.columns
+        if col not in ["timestamp", "ipinyouid", "timestamp_dt"]
+    ]
+
+    # Sort by timestamp so the newest row comes first
+    df_clean = df_clean.sort_values("timestamp_dt", ascending=False)
+
+    # Remove duplicates where every column except timestamp and iPinYouid
+    # is identical. The newest timestamp is retained.
+    df_clean = df_clean.drop_duplicates(
+        subset=compare_cols,
+        keep="first"
+    )
+
+    # Remove helper column
+    df_clean = df_clean.drop(columns="timestamp_dt")
+
+    # Reset index
+    df_clean = df_clean.reset_index(drop=True)
+
+    df_duplicated = df_clean 
+
+    """Combine usertags"""
+    random_rows = df_duplicated.groupby("bidid").sample(n=1, random_state=42)
+
+    # Combine all usertags for each bidid
+    combined_tags = (
+        df_duplicated.groupby("bidid")["usertag"]
+        .apply(lambda x: ",".join(sorted(set(
+            tag
+            for value in x.dropna()
+            for tag in value.split(",")
+        ))))
+    )
+
+    # Replace the usertag in the randomly selected rows
+    random_rows["usertag"] = random_rows["bidid"].map(combined_tags)
+
+    # Result
+    df_combined = random_rows.reset_index(drop=True)
+
+    """Remove duplicates from df and then append the cleaned duplicates"""
+    # remove all original rows whose bidid has been tidied 
+    df_clean = df[~df['bidid'].isin(df_combined['bidid'])].copy()
+
+    # append the tidied duplicates back in 
+    df_clean = pd.concat(
+        [df_clean, df_combined],
+        ignore_index=True
+    )
+    print(f"Before cleaning the df has shape {df.shape}")
+    print(f"After cleaning the df has shape {df_clean.shape}")
+
+    return df_clean
+
 
 def drop_creatives_with_no_variation_in_slot_visibility(df: pd.DataFrame, rows: list = CREATIVES_TO_DROP) -> pd.DataFrame:
     """"""
@@ -112,10 +201,20 @@ def drop_creatives_with_no_variation_in_slot_visibility(df: pd.DataFrame, rows: 
 
 
 def add_cyclical_hour_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Encode 'hour' (0-23) as sine/cosine pairs to preserve cyclical structure."""
+    """"""
     df = df.copy()
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+    spline = SplineTransformer(
+    degree=3,
+    n_knots=8,
+    extrapolation='periodic', # hours are cyclical 
+    include_bias=False 
+    )
+    spline_features = spline.fit_transform(df["hour"].to_numpy().reshape(-1,1))
+    spline_columns = [f"hour_spline_{i}"
+                      for i in range(spline_features.shape[1])
+                      ]
+    df[spline_columns] = spline_features
+
     df = df.drop(columns=["hour"])
     return df
 
@@ -168,6 +267,7 @@ def build_feature_matrix(file_path: str = FILE_PATH) -> pd.DataFrame:
     encode these downstream, inside your DoubleML cross-fitting loop.
     """
     df = load_data(file_path)
+    df = drop_duplicates(df)
     df = drop_unused_columns(df)
     # commented out whilst testing if trimming does this appropriately
     df = drop_creatives_with_no_variation_in_slot_visibility(df)
