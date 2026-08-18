@@ -13,8 +13,9 @@ into the covariates.
 
 """
 
-import numpy as np
 import pandas as pd
+
+import string # mapping creative ids
 
 from sklearn.preprocessing import SplineTransformer # hour transformation
 
@@ -97,6 +98,28 @@ def load_data(file_path: str = FILE_PATH, dtypes: dict = DTYPES) -> pd.DataFrame
         na_values=["null"],
     )
     print("Finished loading df.")
+    return df
+
+def map_creatives(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    The creative ids are long hashed variables which are hard to interpret. 
+    This function changes them to A, B, C,...
+    """
+
+    creative_ids = sorted(df["creative"].astype(str).unique())
+    labels = list(string.ascii_uppercase[:len(creative_ids)])
+    creative_mapping = pd.DataFrame({
+        "creative_original": creative_ids,
+        "creative_short": labels
+    })
+    creative_map = dict(zip(
+        creative_mapping["creative_original"],
+        creative_mapping["creative_short"]
+    ))
+    print(creative_map)
+    df["creative_label"] = df["creative"].astype(str).map(creative_map)
+    df["creative"] = df["creative_label"]
+    df.drop(columns=["creative_label"], inplace=True)
     return df
 
 
@@ -267,6 +290,7 @@ def build_feature_matrix(file_path: str = FILE_PATH) -> pd.DataFrame:
     encode these downstream, inside your DoubleML cross-fitting loop.
     """
     df = load_data(file_path)
+    df = map_creatives(df)
     df = drop_duplicates(df)
     df = drop_unused_columns(df)
     # commented out whilst testing if trimming does this appropriately
